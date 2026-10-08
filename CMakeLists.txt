@@ -66,6 +66,8 @@ set(SOURCE_FILES
         lib/chunk_downloader.c
         lib/mock_http_perform.h
         lib/http_perform.c
+        lib/sf_tls.h
+        lib/sf_tls.c
 )
 
 set (SOURCE_FILES_PUT_GET

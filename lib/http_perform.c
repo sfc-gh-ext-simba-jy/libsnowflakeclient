@@ -27,6 +27,7 @@
 #include "constants.h"
 #include "client_int.h"
 #include "snowflake_util.h"
+#include "sf_tls.h"
 
 static void
 dump(const char *text, FILE *stream, unsigned char *ptr, size_t size,
@@ -424,6 +425,8 @@ sf_bool STDCALL http_perform(CURL *curl,
         return SF_BOOLEAN_FALSE;
     }
 
+    struct sf_tls_config tls_config = { *crl_config };
+
     // Set libcurl error buffer for detailed diagnostics
     char curl_error_buffer[CURL_ERROR_SIZE];
     curl_error_buffer[0] = '\0';
@@ -633,62 +636,11 @@ sf_bool STDCALL http_perform(CURL *curl,
             break;
         }
 
-        res = curl_easy_setopt(curl, CURLOPT_SSL_SF_CRL_CHECK, (long)crl_config->check);
+        res = sf_tls_setup(curl, &tls_config);
         if (res != CURLE_OK) {
-          log_error("Unable to set CRL CHECK [%s]",
+          log_error("Unable to set up CRL check [%s]",
                     curl_easy_strerror(res));
           break;
-        }
-
-        if (crl_config->check)
-        {
-          res = curl_easy_setopt(curl, CURLOPT_SSL_SF_CRL_ADVISORY, (long)crl_config->advisory);
-          if (res != CURLE_OK)
-          {
-            log_error("Unable to set CRL advisory mode [%s]",
-                      curl_easy_strerror(res));
-            break;
-          }
-
-          res = curl_easy_setopt(curl, CURLOPT_SSL_SF_CRL_ALLOW_NO_CRL, (long)crl_config->allow_no_crl);
-          if (res != CURLE_OK)
-          {
-            log_error("Unable to set CRL allow null crl [%s]",
-                      curl_easy_strerror(res));
-            break;
-          }
-
-          res = curl_easy_setopt(curl, CURLOPT_SSL_SF_CRL_DISK_CACHING, (long)crl_config->disk_caching);
-          if (res != CURLE_OK)
-          {
-            log_error("Unable to set CRL disk caching [%s]",
-                      curl_easy_strerror(res));
-            break;
-          }
-
-          res = curl_easy_setopt(curl, CURLOPT_SSL_SF_CRL_MEMORY_CACHING, (long)crl_config->memory_caching);
-          if (res != CURLE_OK)
-          {
-            log_error("Unable to set CRL memory caching [%s]",
-                      curl_easy_strerror(res));
-            break;
-          }
-
-          res = curl_easy_setopt(curl, CURLOPT_SSL_SF_CRL_DOWNLOAD_TIMEOUT, (long)crl_config->download_timeout);
-          if (res != CURLE_OK)
-          {
-              log_error("Unable to set CRL download timeout [%s]",
-                        curl_easy_strerror(res));
-              break;
-          }
-
-          res = curl_easy_setopt(curl, CURLOPT_SSL_SF_CRL_DOWNLOAD_MAX_SIZE, (long)crl_config->download_max_size);
-          if (res != CURLE_OK)
-          {
-              log_warn("Unable to set CRL download max size [%s], using default",
-                       curl_easy_strerror(res));
-              res = CURLE_OK;
-          }
         }
 
         // Set chunk downloader specific stuff here

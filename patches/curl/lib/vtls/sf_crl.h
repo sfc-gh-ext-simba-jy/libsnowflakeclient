@@ -1,6 +1,7 @@
 #ifndef HEADER_CURL_SF_CRL_H
 #define HEADER_CURL_SF_CRL_H
 
+#include <stdbool.h>
 #include <openssl/ssl.h>
 
 #ifdef _WIN32
@@ -20,8 +21,9 @@
 #define SF_CRL_ON_DISK_CACHE_REMOVAL_DELAY_DEFAULT 604800L /* 7 days */
 #define SF_CRL_CACHE_CLEANUP_INTERVAL_DEFAULT 3600L        /* 1 hour */
 
-SF_PUBLIC(void) registerCRLCheck(struct Curl_easy *data,
-                                 X509_STORE *ctx,
+typedef void (*sf_crl_log_fn)(const char *msg);
+
+SF_PUBLIC(void) registerCRLCheck(X509_STORE *ctx,
                                  bool crl_advisory,
                                  bool crl_allow_no_crl,
                                  bool crl_disk_caching,
@@ -31,6 +33,7 @@ SF_PUBLIC(void) registerCRLCheck(struct Curl_easy *data,
 
 SF_PUBLIC(void) initCertCRL(void);
 SF_PUBLIC(void) termCertCRL(void);
+SF_PUBLIC(void) setCertCRLLogger(sf_crl_log_fn log_fn);
 
 /* Remove expired/evicted in-memory CRLs and old on-disk cache files. */
 SF_PUBLIC(void) cleanupCertCRLCache(void);

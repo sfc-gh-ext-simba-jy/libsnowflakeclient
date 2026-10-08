@@ -18,6 +18,7 @@
 #include "authenticator.h"
 #include "query_context_cache.h"
 #include "snowflake_util.h"
+#include "sf_tls.h"
 
 #ifdef _WIN32
 #include <Shellapi.h>
@@ -1137,6 +1138,7 @@ SF_STATUS STDCALL snowflake_global_init(
                   curl_easy_strerror(curl_ret));
         goto cleanup;
     }
+    sf_tls_global_init();
 
     if (SF_HEADER_USER_AGENT == NULL) {
 #ifdef __STDC__
@@ -1160,6 +1162,7 @@ cleanup:
 extern void awssdk_shutdown();
 SF_STATUS STDCALL snowflake_global_term() {
     curl_global_cleanup();
+    sf_tls_global_term();
 
     // Cleanup Constants
     SF_FREE(CA_BUNDLE_FILE);

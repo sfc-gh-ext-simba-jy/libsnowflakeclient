@@ -18,6 +18,7 @@
 #endif
 
 #include "client_int.h"
+#include "sf_tls.h"
 #include "snowflake/CurlDescPool.hpp"
 #include "utils/test_setup.h"
 #include "EnvOverride.hpp"
@@ -220,14 +221,18 @@ void test_curl_crl_params(void **unused) {
   ch = curl_easy_init();
   assert_non_null(ch);
 
-  assert_int_equal(curl_easy_setopt(ch, CURLOPT_SSL_SF_CRL_DOWNLOAD_TIMEOUT, 1L), CURLE_OK);
-  assert_int_equal(curl_easy_setopt(ch, CURLOPT_SSL_SF_CRL_ALLOW_NO_CRL, 1L), CURLE_OK);
-  assert_int_equal(curl_easy_setopt(ch, CURLOPT_SSL_SF_CRL_CHECK, 1L), CURLE_OK);
-  assert_int_equal(curl_easy_setopt(ch, CURLOPT_SSL_SF_CRL_DISK_CACHING, 1L), CURLE_OK);
-  assert_int_equal(curl_easy_setopt(ch, CURLOPT_SSL_SF_CRL_MEMORY_CACHING, 1L), CURLE_OK);
+  sf_tls_config cfg = {};
+  cfg.crl.check = SF_BOOLEAN_TRUE;
+  cfg.crl.allow_no_crl = SF_BOOLEAN_TRUE;
+  cfg.crl.disk_caching = SF_BOOLEAN_TRUE;
+  cfg.crl.memory_caching = SF_BOOLEAN_TRUE;
+  cfg.crl.download_timeout = 1;
+  cfg.crl.download_max_size = 100 * 1024 * 1024;
+  assert_int_equal(sf_tls_setup(ch, &cfg), CURLE_OK);
 
-  CURLcode maxSizeRes = curl_easy_setopt(ch, CURLOPT_SSL_SF_CRL_DOWNLOAD_MAX_SIZE, (long)(100 * 1024 * 1024));
-  assert_true(maxSizeRes == CURLE_OK || maxSizeRes == CURLE_UNKNOWN_OPTION);
+  cfg.crl.check = SF_BOOLEAN_FALSE;
+  assert_int_equal(sf_tls_setup(ch, &cfg), CURLE_OK);
+  assert_int_equal(sf_tls_setup(ch, nullptr), CURLE_OK);
 
   curl_easy_cleanup(ch);
 }
@@ -303,6 +308,7 @@ void test_crl_cache(void **unused) {
   const std::string cache_dir = get_cache_dir();
 
   CURL *ch = nullptr;
+  sf_tls_config cfg = {};
   {
     EnvOverride override("SF_CRL_RESPONSE_CACHE_DIR", cache_dir);
     assert_true(!dir_has_files(cache_dir));
@@ -310,8 +316,9 @@ void test_crl_cache(void **unused) {
     ch = curl_easy_init();
     assert_non_null(ch);
 
-    assert_int_equal(curl_easy_setopt(ch, CURLOPT_SSL_SF_CRL_CHECK, 1L), CURLE_OK);
-    assert_int_equal(curl_easy_setopt(ch, CURLOPT_SSL_SF_CRL_DISK_CACHING, 1L), CURLE_OK);
+    cfg.crl.check = SF_BOOLEAN_TRUE;
+    cfg.crl.disk_caching = SF_BOOLEAN_TRUE;
+    assert_int_equal(sf_tls_setup(ch, &cfg), CURLE_OK);
     curl_easy_setopt(ch, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
     curl_easy_setopt(ch, CURLOPT_VERBOSE, 1L);
     curl_easy_setopt(ch, CURLOPT_URL, "https://snowflake.com");
@@ -520,6 +527,7 @@ void test_no_crl_cache_if_disabled(void **unused) {
   const std::string cache_dir = get_cache_dir();
 
   CURL *ch = nullptr;
+  sf_tls_config cfg = {};
   {
     EnvOverride override("SF_CRL_RESPONSE_CACHE_DIR", cache_dir);
     assert_true(!dir_has_files(cache_dir));
@@ -527,8 +535,9 @@ void test_no_crl_cache_if_disabled(void **unused) {
     ch = curl_easy_init();
     assert_non_null(ch);
 
-    assert_int_equal(curl_easy_setopt(ch, CURLOPT_SSL_SF_CRL_CHECK, 1L), CURLE_OK);
-    assert_int_equal(curl_easy_setopt(ch, CURLOPT_SSL_SF_CRL_DISK_CACHING, 0L), CURLE_OK);
+    cfg.crl.check = SF_BOOLEAN_TRUE;
+    cfg.crl.disk_caching = SF_BOOLEAN_FALSE;
+    assert_int_equal(sf_tls_setup(ch, &cfg), CURLE_OK);
     curl_easy_setopt(ch, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
     curl_easy_setopt(ch, CURLOPT_VERBOSE, 1L);
     curl_easy_setopt(ch, CURLOPT_URL, "https://snowflake.com");

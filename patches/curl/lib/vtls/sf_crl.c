@@ -1,13 +1,21 @@
-#include "curl_setup.h"
-#include "curl_trc.h"
-#include "urldata.h"
-#include "sendf.h"
-#include "sf_ocsp.h"
+#ifdef _WIN32
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#endif
+
 #include "sf_crl.h"
 
 #include <stdbool.h>
 #include <openssl/x509v3.h>
+#include <openssl/pem.h>
+#include <openssl/http.h>
+#include <sys/types.h>
 #include <sys/stat.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -18,6 +26,7 @@
 #ifdef _WIN32
 #define strcasecmp _stricmp
 #include <windows.h>
+#include <direct.h>
 typedef HANDLE SF_MUTEX_HANDLE;
 typedef HANDLE SF_THREAD_HANDLE;
 #ifndef PATH_MAX
@@ -25,6 +34,7 @@ typedef HANDLE SF_THREAD_HANDLE;
 #endif
 #else
 #include <pthread.h>
+#include <strings.h>
 #include <unistd.h>
 #include <dirent.h>
 typedef pthread_mutex_t SF_MUTEX_HANDLE;
@@ -36,6 +46,20 @@ static SF_THREAD_HANDLE crl_cleanup_thread;
 static volatile int crl_cleanup_stop = 0;
 static int crl_cleanup_thread_started = 0;
 static int crl_cache_initialized = 0;
+static sf_crl_log_fn crl_log_fn = NULL;
+
+static void crl_log(const char *fmt, ...)
+{
+  char msg[1024];
+  va_list args;
+
+  if (!crl_log_fn)
+    return;
+  va_start(args, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, args);
+  va_end(args);
+  crl_log_fn(msg);
+}
 
 static int _mutex_init(SF_MUTEX_HANDLE *lock);
 static int _mutex_lock(SF_MUTEX_HANDLE *lock);
@@ -128,7 +152,6 @@ static void _sleep_sec(void)
  ************************************************************************************/
 struct store_ctx_entry {
   const X509_STORE *ctx;
-  struct Curl_easy *data;
   int crl_advisory;
   int crl_allow_no_crl;
   int crl_disk_caching;
@@ -171,7 +194,7 @@ static struct store_ctx_entry *sctx_lookup(const X509_STORE *ctx)
   return NULL;
 }
 
-static void sctx_register(const X509_STORE *ctx, struct Curl_easy *data, bool crl_advisory,
+static void sctx_register(const X509_STORE *ctx, bool crl_advisory,
                           bool crl_allow_no_crl, bool crl_disk_caching, bool crl_memory_caching,
                           long crl_download_timeout, long crl_download_max_size)
 {
@@ -179,7 +202,6 @@ static void sctx_register(const X509_STORE *ctx, struct Curl_easy *data, bool cr
 
   existing = sctx_lookup(ctx);
   if (existing) {
-    existing->data = data;
     existing->crl_advisory = crl_advisory;
     existing->crl_allow_no_crl = crl_allow_no_crl;
     existing->crl_disk_caching = crl_disk_caching;
@@ -192,7 +214,6 @@ static void sctx_register(const X509_STORE *ctx, struct Curl_easy *data, bool cr
   if (!sctx_ensure_capacity())
     return;
   sctx_registry.entries[sctx_registry.size].ctx = ctx;
-  sctx_registry.entries[sctx_registry.size].data = data;
   sctx_registry.entries[sctx_registry.size].crl_advisory = crl_advisory;
   sctx_registry.entries[sctx_registry.size].crl_allow_no_crl = crl_allow_no_crl;
   sctx_registry.entries[sctx_registry.size].crl_disk_caching = crl_disk_caching;
@@ -393,7 +414,7 @@ static const char *get_dp_url(DIST_POINT *dp)
   return NULL;
 }
 
-static const char* mkdir_if_not_exists(const struct Curl_easy *data, const char* dir)
+static const char* mkdir_if_not_exists(bool verbose, const char* dir)
 {
 #ifdef _WIN32
   int result = _mkdir(dir);
@@ -402,17 +423,17 @@ static const char* mkdir_if_not_exists(const struct Curl_easy *data, const char*
 #endif
   if (result != 0 && errno != EEXIST)
   {
-    if (data)
-      failf(data, "Failed to create %s directory. Ignored. Error: %d",
+    if (verbose)
+      crl_log("Failed to create %s directory. Ignored. Error: %d",
             dir, errno);
     return NULL;
   }
-  if (data)
-    infof(data, "Created %s directory.", dir);
+  if (verbose)
+    crl_log("Created %s directory.", dir);
   return dir;
 }
 
-static char* ensure_cache_dir(const struct Curl_easy *data, char* cache_dir)
+static char* ensure_cache_dir(bool verbose, char* cache_dir)
 {
 #ifdef __linux__
   char *home_env = getenv("HOME");
@@ -420,22 +441,22 @@ static char* ensure_cache_dir(const struct Curl_easy *data, char* cache_dir)
     return NULL;
   }
   strncpy(cache_dir, home_env, PATH_MAX);
-  if (mkdir_if_not_exists(data, cache_dir) == NULL)
+  if (mkdir_if_not_exists(verbose, cache_dir) == NULL)
   {
     return NULL;
   }
   strncat(cache_dir, "/.cache", PATH_MAX);
-  if (mkdir_if_not_exists(data, cache_dir) == NULL)
+  if (mkdir_if_not_exists(verbose, cache_dir) == NULL)
   {
     return NULL;
   }
   strncat(cache_dir, "/snowflake", PATH_MAX);
-  if (mkdir_if_not_exists(data, cache_dir) == NULL)
+  if (mkdir_if_not_exists(verbose, cache_dir) == NULL)
   {
     return NULL;
   }
   strncat(cache_dir, "/crls", PATH_MAX);
-  if (mkdir_if_not_exists(data, cache_dir) == NULL)
+  if (mkdir_if_not_exists(verbose, cache_dir) == NULL)
   {
     return NULL;
   }
@@ -446,27 +467,27 @@ static char* ensure_cache_dir(const struct Curl_easy *data, char* cache_dir)
     return NULL;
   }
   strncpy(cache_dir, home_env, PATH_MAX);
-  if (mkdir_if_not_exists(data, cache_dir) == NULL)
+  if (mkdir_if_not_exists(verbose, cache_dir) == NULL)
   {
     return NULL;
   }
   strncat(cache_dir, "/Library", PATH_MAX);
-  if (mkdir_if_not_exists(data, cache_dir) == NULL)
+  if (mkdir_if_not_exists(verbose, cache_dir) == NULL)
   {
     return NULL;
   }
   strncat(cache_dir, "/Caches", PATH_MAX);
-  if (mkdir_if_not_exists(data, cache_dir) == NULL)
+  if (mkdir_if_not_exists(verbose, cache_dir) == NULL)
   {
     return NULL;
   }
   strncat(cache_dir, "/Snowflake", PATH_MAX);
-  if (mkdir_if_not_exists(data, cache_dir) == NULL)
+  if (mkdir_if_not_exists(verbose, cache_dir) == NULL)
   {
     return NULL;
   }
   strncat(cache_dir, "/crls", PATH_MAX);
-  if (mkdir_if_not_exists(data, cache_dir) == NULL)
+  if (mkdir_if_not_exists(verbose, cache_dir) == NULL)
   {
     return NULL;
   }
@@ -478,17 +499,17 @@ static char* ensure_cache_dir(const struct Curl_easy *data, char* cache_dir)
   }
   strncat(cache_dir, home_env, PATH_MAX);
   strncat(cache_dir, "\\Snowflake", PATH_MAX);
-  if (mkdir_if_not_exists(data, cache_dir) == NULL)
+  if (mkdir_if_not_exists(verbose, cache_dir) == NULL)
   {
     return NULL;
   }
   strncat(cache_dir, "\\Caches", PATH_MAX);
-  if (mkdir_if_not_exists(data, cache_dir) == NULL)
+  if (mkdir_if_not_exists(verbose, cache_dir) == NULL)
   {
     return NULL;
   }
   strncat(cache_dir, "\\crls", PATH_MAX);
-  if (mkdir_if_not_exists(data, cache_dir) == NULL)
+  if (mkdir_if_not_exists(verbose, cache_dir) == NULL)
   {
     return NULL;
   }
@@ -497,15 +518,15 @@ static char* ensure_cache_dir(const struct Curl_easy *data, char* cache_dir)
   return cache_dir;
 }
 
-static void get_cache_dir(const struct Curl_easy *data, char* cache_dir)
+static void get_cache_dir(bool verbose, char* cache_dir)
 {
   const char *env_dir;
 
   cache_dir[0] = 0;
 
   env_dir = getenv(SF_CRL_RESPONSE_CACHE_DIR_ENV);
-  if (data)
-    infof(data, "CRL cache directory from environment: %s", env_dir ? env_dir : "(not set)");
+  if (verbose)
+    crl_log("CRL cache directory from environment: %s", env_dir ? env_dir : "(not set)");
   if (env_dir) {
     strncpy(cache_dir, env_dir, PATH_MAX);
 #if defined(_WIN32)
@@ -521,13 +542,13 @@ static void get_cache_dir(const struct Curl_easy *data, char* cache_dir)
 #endif
   }
   else {
-    ensure_cache_dir(data, cache_dir);
+    ensure_cache_dir(verbose, cache_dir);
   }
 }
 
 static void get_file_path_by_uri(const struct store_ctx_entry *data, const char *uri, char* file_path)
 {
-  get_cache_dir(data->data, file_path);
+  get_cache_dir(true, file_path);
   if (*file_path) {
     char file_name[PATH_MAX] = {0};
     strncpy(file_name, uri, PATH_MAX);
@@ -553,11 +574,11 @@ static void save_crl_to_disk(const struct store_ctx_entry *data, const char *uri
   char file_path[PATH_MAX] = {0};
 
   if (!data->crl_disk_caching) {
-    infof(data->data, "CRL disk caching is disabled. Not saving CRL to disk. (URI: %s)", uri);
+    crl_log("CRL disk caching is disabled. Not saving CRL to disk. (URI: %s)", uri);
     return;
   }
 
-  infof(data->data, "CRL disk caching is enabled. Saving CRL to disk: (URI: %s)", uri);
+  crl_log("CRL disk caching is enabled. Saving CRL to disk: (URI: %s)", uri);
 
   if (*pcrl != NULL && data->crl_disk_caching) {
     get_file_path_by_uri(data, uri, file_path);
@@ -565,15 +586,15 @@ static void save_crl_to_disk(const struct store_ctx_entry *data, const char *uri
       fp = BIO_new_file(file_path, "w");
       if (fp) {
         if (!PEM_write_bio_X509_CRL(fp, *pcrl))
-          infof(data->data, "Cannot save CRL content to file: %s", file_path);
+          crl_log("Cannot save CRL content to file: %s", file_path);
         BIO_free(fp);
       }
       else {
-        infof(data->data, "Cannot open CRL file to save (errno %d): %s", errno, file_path);
+        crl_log("Cannot open CRL file to save (errno %d): %s", errno, file_path);
       }
     }
     else {
-      infof(data->data, "Cannot resolve path for CRL cache");
+      crl_log("Cannot resolve path for CRL cache");
     }
   }
 }
@@ -592,7 +613,7 @@ static void get_crl_from_memory(const struct store_ctx_entry *data, const char *
     *pcrl = X509_CRL_dup(ucrl->crl);
   }
   if (*pcrl)
-    infof(data->data, "CRL loaded from memory: %s", uri);
+    crl_log("CRL loaded from memory: %s", uri);
 
 }
 
@@ -611,11 +632,11 @@ static void get_crl_from_disk(const struct store_ctx_entry *data, const char *ur
   char file_path[PATH_MAX] = {0};
 
   if (!data->crl_disk_caching) {
-    infof(data->data, "CRL disk caching is disabled. Not loading CRL from disk (URI: %s)", uri);
+    crl_log("CRL disk caching is disabled. Not loading CRL from disk (URI: %s)", uri);
     return;
   }
 
-  infof(data->data, "CRL disk caching is enabled. Loading CRL from disk (URI: %s)", uri);
+  crl_log("CRL disk caching is enabled. Loading CRL from disk (URI: %s)", uri);
 
   // lookup for CRL on disk
   get_file_path_by_uri(data, uri, file_path);
@@ -631,22 +652,22 @@ static void get_crl_from_disk(const struct store_ctx_entry *data, const char *ur
             *download_time = file_stats.st_mtime;
         }
         else {
-          infof(data->data, "Cannot get file status: %s", file_path);
+          crl_log("Cannot get file status: %s", file_path);
         }
       }
       else {
-        infof(data->data, "Cannot obtain file descriptor: %s", file_path);
+        crl_log("Cannot obtain file descriptor: %s", file_path);
       }
 
       BIO_free(fp);
     }
     else {
-      infof(data->data, "Cannot open file to read (errno %d): %s", errno, file_path);
+      crl_log("Cannot open file to read (errno %d): %s", errno, file_path);
     }
   }
 
   if (*pcrl)
-    infof(data->data, "CRL loaded from disk: %s", uri);
+    crl_log("CRL loaded from disk: %s", uri);
 }
 
 static bool get_crl_from_cache(const struct store_ctx_entry *data, const char *uri,
@@ -671,7 +692,7 @@ static bool get_crl_from_cache(const struct store_ctx_entry *data, const char *u
     return false;
 
   if (is_crl_expired(*pcrl)) {
-    infof(data->data, "CRL need to be updated: %s", uri);
+    crl_log("CRL need to be updated: %s", uri);
 
     return false;
   }
@@ -713,9 +734,9 @@ static X509_CRL *load_crl(struct store_ctx_entry *data, const char *uri)
   crl = (X509_CRL *)res;
 
   if (crl)
-    infof(data->data, "CRL loaded from http: %s", uri);
+    crl_log("CRL loaded from http: %s", uri);
   else
-    infof(data->data, "CRL cannot be loaded from http: %s", uri);
+    crl_log("CRL cannot be loaded from http: %s", uri);
 
   if (crl &&
       (!crl_cached ||
@@ -773,7 +794,7 @@ static STACK_OF(X509_CRL) *lookup_crls_handler(const X509_STORE_CTX *ctx,
 
   const char *no_crl = getenv("SF_TEST_CRL_NO_CRL");
   if (no_crl && strcasecmp(no_crl, "true") == 0) {
-    infof(data->data, "SF_TEST_CRL_NO_CRL is set, no CRL will be loaded");
+    crl_log("SF_TEST_CRL_NO_CRL is set, no CRL will be loaded");
     return NULL;
   }
 
@@ -816,7 +837,7 @@ static int error_handler(int ok, X509_STORE_CTX *ctx)
 
   if (err == X509_V_ERR_UNABLE_TO_GET_CRL) {
     if (X509_self_signed(err_cert, 1)) {
-      infof(data->data, "CRL validation skipped error %d - self signed, subject=%s",
+      crl_log("CRL validation skipped error %d - self signed, subject=%s",
             err,
             X509_NAME_oneline(X509_get_subject_name(err_cert), X509_cert_name,
                               MAX_CERT_NAME_LEN));
@@ -824,7 +845,7 @@ static int error_handler(int ok, X509_STORE_CTX *ctx)
       return 1;
     }
     if (data->crl_allow_no_crl && data->curr_crl_num == 0) {
-      infof(data->data, "CRL validation skipped error %d - no crl in the certificate, subject=%s",
+      crl_log("CRL validation skipped error %d - no crl in the certificate, subject=%s",
             err,
             X509_NAME_oneline(X509_get_subject_name(err_cert), X509_cert_name,
                               MAX_CERT_NAME_LEN));
@@ -832,7 +853,7 @@ static int error_handler(int ok, X509_STORE_CTX *ctx)
       return 1;
     }
     if (data->crl_advisory) {
-      infof(data->data, "CRL validation skipped error %d - advisory mode, subject=%s",
+      crl_log("CRL validation skipped error %d - advisory mode, subject=%s",
             err,
             X509_NAME_oneline(X509_get_subject_name(err_cert), X509_cert_name,
                               MAX_CERT_NAME_LEN));
@@ -841,13 +862,12 @@ static int error_handler(int ok, X509_STORE_CTX *ctx)
     }
   }
 
-  infof(data->data,
-        "Certificate validation error, subject=%s, error %d at depth %d, %s",
-        X509_NAME_oneline(X509_get_subject_name(err_cert), X509_cert_name,
-                          MAX_CERT_NAME_LEN),
-        err,
-        X509_STORE_CTX_get_error_depth(ctx),
-        X509_verify_cert_error_string(err));
+  crl_log("Certificate validation error, subject=%s, error %d at depth %d, %s",
+          X509_NAME_oneline(X509_get_subject_name(err_cert), X509_cert_name,
+                            MAX_CERT_NAME_LEN),
+          err,
+          X509_STORE_CTX_get_error_depth(ctx),
+          X509_verify_cert_error_string(err));
 
 
   return 0;
@@ -941,7 +961,7 @@ static void cleanup_disk_cache(void)
                                          SF_CRL_ON_DISK_CACHE_REMOVAL_DELAY_DEFAULT);
   time_t threshold = now - removal_delay;
 
-  get_cache_dir(NULL, cache_dir);
+  get_cache_dir(false, cache_dir);
   if (!*cache_dir)
     return;
 
@@ -1091,8 +1111,7 @@ SF_PUBLIC(void) termCertCRL(void)
   term_crl();
 }
 
-SF_PUBLIC(void) registerCRLCheck(struct Curl_easy *data,
-                                 X509_STORE *ctx,
+SF_PUBLIC(void) registerCRLCheck(X509_STORE *ctx,
                                  bool crl_advisory,
                                  bool crl_allow_no_crl,
                                  bool crl_disk_caching,
@@ -1101,13 +1120,13 @@ SF_PUBLIC(void) registerCRLCheck(struct Curl_easy *data,
                                  long crl_download_max_size)
 {
   char cache_dir[PATH_MAX] = "";
-  infof(data, "Registering SF CRL Validation...");
+  crl_log("Registering SF CRL Validation...");
 
-  get_cache_dir(data, cache_dir);
+  get_cache_dir(true, cache_dir);
   if (*cache_dir)
-    infof(data, "CRL cache file directory: %s", cache_dir);
+    crl_log("CRL cache file directory: %s", cache_dir);
   else
-    infof(data, "CRL cache file directory not exists!");
+    crl_log("CRL cache file directory not exists!");
 
 
   /* register handler to read CRLs */
@@ -1119,7 +1138,7 @@ SF_PUBLIC(void) registerCRLCheck(struct Curl_easy *data,
   X509_STORE_set_flags(ctx, X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL | X509_V_FLAG_X509_STRICT);
 
   /* register X509_STORE with given parameters */
-  sctx_register(ctx, data,
+  sctx_register(ctx,
                crl_advisory, crl_allow_no_crl, crl_disk_caching, crl_memory_caching,
                crl_download_timeout, crl_download_max_size);
 }
@@ -1131,4 +1150,9 @@ SF_PUBLIC(void) initCertCRL()
   crl_cache_initialized = 1;
   start_crl_cleanup_thread();
   atexit(term_crl);
+}
+
+SF_PUBLIC(void) setCertCRLLogger(sf_crl_log_fn log_fn)
+{
+  crl_log_fn = log_fn;
 }

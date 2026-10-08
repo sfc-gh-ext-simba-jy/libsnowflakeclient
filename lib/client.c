@@ -18,7 +18,6 @@
 #include "authenticator.h"
 #include "query_context_cache.h"
 #include "snowflake_util.h"
-#include "sf_tls.h"
 
 #ifdef _WIN32
 #include <Shellapi.h>

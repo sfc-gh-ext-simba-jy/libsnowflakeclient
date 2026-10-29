@@ -6,6 +6,7 @@
 #include <openssl/crypto.h>
 #include <snowflake/client.h>
 #include <snowflake/client_config_parser.h>
+#include <snowflake/tls_policy.h>
 #include <snowflake/Stopwatch.h>
 #include "constants.h"
 #include "client_int.h"
@@ -1274,6 +1275,7 @@ SF_CONNECT *STDCALL snowflake_init() {
         // Initialize object with default values
         sf->host = NULL;
         sf->port = NULL;
+        sf->port_explicit = SF_BOOLEAN_FALSE;
         sf->user = NULL;
         sf->password = NULL;
         sf->database = NULL;
@@ -1497,6 +1499,48 @@ SF_CONNECT* STDCALL snowflake_connect_with_toml() {
     return sf;
 }
 
+// Returns a newly allocated string with the OAuth token-endpoint URL used as
+// the `idp` component of the token cache key. Mirrors AuthenticatorOAuth's
+// default (https://<host>/oauth/token-request) when no explicit endpoint is
+// configured, so cached OAuth tokens key off the same IdP the flow uses.
+// Caller owns the result and must SF_FREE it.
+static char* sf_oauth_idp_url(SF_CONNECT* sf) {
+    if (sf->oauth_token_endpoint && sf->oauth_token_endpoint[0] != '\0') {
+        size_t len = strlen(sf->oauth_token_endpoint) + 1;
+        char* url = (char*)SF_CALLOC(1, len);
+        if (!url) { return NULL; }
+        sf_strncpy(url, len, sf->oauth_token_endpoint, len);
+        return url;
+    }
+
+    const char* host = sf->host ? sf->host : "";
+    const char* postfix = "/oauth/token-request";
+    size_t len = strlen("https://") + strlen(host) + strlen(postfix) + 1;
+    char* url = (char*)SF_CALLOC(1, len);
+    if (!url) { return NULL; }
+    sf_sprintf(url, len, "https://%s%s", host, postfix);
+    return url;
+}
+
+// Returns a newly allocated string with the `snowflake` component of the token
+// cache key: the host, followed by ":<port>" only when the caller set the port
+// explicitly, so an explicit ":443" stays distinct from the default.
+// Caller owns the result and must SF_FREE it.
+static char* sf_token_cache_snowflake_url(SF_CONNECT* sf) {
+    const char* host = sf->host ? sf->host : "";
+    sf_bool with_port = sf->port_explicit && !is_string_empty(sf->port);
+    size_t len = strlen(host) + (with_port ? strlen(sf->port) + 1 : 0) + 1;
+    char* url = (char*)SF_CALLOC(1, len);
+    if (!url) { return NULL; }
+    if (with_port) {
+        sf_sprintf(url, len, "%s:%s", host, sf->port);
+    }
+    else {
+        sf_sprintf(url, len, "%s", host);
+    }
+    return url;
+}
+
 SF_STATUS STDCALL snowflake_connect(SF_CONNECT* sf) {
     sf_bool success = SF_BOOLEAN_FALSE;
     SF_JSON_ERROR json_error;
@@ -1519,6 +1563,13 @@ SF_STATUS STDCALL snowflake_connect(SF_CONNECT* sf) {
 
     // Reset error context
     clear_snowflake_error(&sf->error);
+
+    char tls_policy_error[512];
+    if (sf_tls_policy_check(tls_policy_error, sizeof(tls_policy_error)) != SF_STATUS_SUCCESS) {
+        SET_SNOWFLAKE_ERROR(&sf->error, SF_STATUS_ERROR_BAD_CONNECTION_PARAMS,
+                            tls_policy_error, SF_SQLSTATE_UNABLE_TO_CONNECT);
+        return SF_STATUS_ERROR_BAD_CONNECTION_PARAMS;
+    }
 
     char os_version[128];
     sf_os_version(os_version, sizeof(os_version));
@@ -1573,7 +1624,9 @@ SF_STATUS STDCALL snowflake_connect(SF_CONNECT* sf) {
                     sf->token_cache = secure_storage_init();
                 }
 
-                sf->mfa_token = secure_storage_get_credential(sf->token_cache, sf->host, sf->user, MFA_TOKEN);
+                char* snowflake_url = sf_token_cache_snowflake_url(sf);
+                sf->mfa_token = secure_storage_get_credential_v2(sf->token_cache, sf->host, sf->user, MFA_TOKEN, NULL, snowflake_url, NULL);
+                SF_FREE(snowflake_url);
             }
             break;
 
@@ -1585,13 +1638,18 @@ SF_STATUS STDCALL snowflake_connect(SF_CONNECT* sf) {
                 {
                     sf->token_cache = secure_storage_init();
                 }
+                const char* role = sf->role ? sf->role : "";
+                char* snowflake_url = sf_token_cache_snowflake_url(sf);
                 if (authtype == AUTH_EXTERNALBROWSER) {
-                    sf->sso_token = secure_storage_get_credential(sf->token_cache, sf->host, sf->user, ID_TOKEN);
+                    sf->sso_token = secure_storage_get_credential_v2(sf->token_cache, sf->host, sf->user, ID_TOKEN, NULL, snowflake_url, NULL);
                 }
                 else {
-                    sf->oauth_token = secure_storage_get_credential(sf->token_cache, sf->host, sf->user, OAUTH_ACCESS_TOKEN);
-                    sf->oauth_refresh_token = secure_storage_get_credential(sf->token_cache, sf->host, sf->user, OAUTH_REFRESH_TOKEN);
+                    char* oauth_idp = sf_oauth_idp_url(sf);
+                    sf->oauth_token = secure_storage_get_credential_v2(sf->token_cache, sf->host, sf->user, OAUTH_ACCESS_TOKEN, oauth_idp, snowflake_url, role);
+                    sf->oauth_refresh_token = secure_storage_get_credential_v2(sf->token_cache, sf->host, sf->user, OAUTH_REFRESH_TOKEN, oauth_idp, snowflake_url, role);
+                    SF_FREE(oauth_idp);
                 }
+                SF_FREE(snowflake_url);
             }
             break;
         default:
@@ -1720,16 +1778,21 @@ SF_STATUS STDCALL snowflake_connect(SF_CONNECT* sf) {
 
             char* auth_token = NULL;
             if (sf->token_cache) {
+                const char* role = sf->role ? sf->role : "";
+                char* snowflake_url = sf_token_cache_snowflake_url(sf);
                 if (json_copy_string(&auth_token, data, "idToken") == SF_JSON_ERROR_NONE) {
-                    secure_storage_save_credential(sf->token_cache, sf->host, sf->user, ID_TOKEN, auth_token);
+                    secure_storage_save_credential_v2(sf->token_cache, sf->host, sf->user, ID_TOKEN, NULL, snowflake_url, NULL, auth_token);
                 }
                 else if (json_copy_string(&auth_token, data, "mfaToken") == SF_JSON_ERROR_NONE) {
-                    secure_storage_save_credential(sf->token_cache, sf->host, sf->user, MFA_TOKEN, auth_token);
+                    secure_storage_save_credential_v2(sf->token_cache, sf->host, sf->user, MFA_TOKEN, NULL, snowflake_url, NULL, auth_token);
                 }
                 else if (authtype == AUTH_OAUTH_AUTHORIZATION_CODE) {
-                    secure_storage_save_credential(sf->token_cache, sf->host, sf->user, OAUTH_ACCESS_TOKEN, sf->oauth_token);
-                    secure_storage_save_credential(sf->token_cache, sf->host, sf->user, OAUTH_REFRESH_TOKEN, sf->oauth_refresh_token);
+                    char* oauth_idp = sf_oauth_idp_url(sf);
+                    secure_storage_save_credential_v2(sf->token_cache, sf->host, sf->user, OAUTH_ACCESS_TOKEN, oauth_idp, snowflake_url, role, sf->oauth_token);
+                    secure_storage_save_credential_v2(sf->token_cache, sf->host, sf->user, OAUTH_REFRESH_TOKEN, oauth_idp, snowflake_url, role, sf->oauth_refresh_token);
+                    SF_FREE(oauth_idp);
                 }
+                SF_FREE(snowflake_url);
             }
 
             _mutex_lock(&sf->mutex_parameters);
@@ -1892,6 +1955,7 @@ SF_STATUS STDCALL snowflake_set_attribute(
             break;
         case SF_CON_PORT:
             alloc_buffer_and_copy(&sf->port, value);
+            sf->port_explicit = is_string_empty(sf->port) ? SF_BOOLEAN_FALSE : SF_BOOLEAN_TRUE;
             break;
         case SF_CON_PROTOCOL:
             alloc_buffer_and_copy(&sf->protocol, value);

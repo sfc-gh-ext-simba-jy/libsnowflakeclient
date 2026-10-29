@@ -66,6 +66,7 @@ void setup_mfa_term_cached_mfa_request_mock() {
 #define ACCOUNT "account"
 #define HOST "host"
 #define USER "user"
+#define TOKEN_CACHE_SNOWFLAKE_URL HOST ":443"
 
 SF_CONNECT* sf_connect_init() {
   SF_CONNECT* sf = snowflake_init();
@@ -83,7 +84,7 @@ void test_mfa_token_caching(void **unused) {
   rmdir("sf_temporary_credential_cache_dir");
   mkdir("sf_temporary_credential_cache_dir", 0700);
   secure_storage_ptr ss = secure_storage_init();
-  secure_storage_remove_credential(ss, HOST, USER, MFA_TOKEN);
+  secure_storage_remove_credential_v2(ss, HOST, USER, MFA_TOKEN, NULL, TOKEN_CACHE_SNOWFLAKE_URL, NULL);
 
   {
     SF_CONNECT *sf = sf_connect_init();

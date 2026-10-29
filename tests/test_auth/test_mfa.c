@@ -79,11 +79,13 @@ void test_mfa_totp_authentication(void **unused) {
 
     SF_CONNECT *sf = snowflake_init();
     set_all_snowflake_attributes(sf);
+    char snowflake_url[1024];
+    token_cache_snowflake_url(sf, snowflake_url, sizeof(snowflake_url));
     
     // Clear any existing MFA token (like mock test does)
     secure_storage_ptr ss = secure_storage_init();
     if (ss) {
-        secure_storage_remove_credential(ss, sf->host, getenv("SNOWFLAKE_AUTH_TEST_MFA_USER"), MFA_TOKEN);
+        secure_storage_remove_credential_v2(ss, sf->host, getenv("SNOWFLAKE_AUTH_TEST_MFA_USER"), MFA_TOKEN, NULL, snowflake_url, NULL);
         secure_storage_term(ss);
     }
     
@@ -121,7 +123,7 @@ void test_mfa_totp_authentication(void **unused) {
         if (status == SF_STATUS_SUCCESS) {
             
             secure_storage_ptr ss_check = secure_storage_init();
-            char* saved_token = secure_storage_get_credential(ss_check, sf->host, mfa_user, MFA_TOKEN);
+            char* saved_token = secure_storage_get_credential_v2(ss_check, sf->host, mfa_user, MFA_TOKEN, NULL, snowflake_url, NULL);
             assert_non_null(saved_token);
             secure_storage_free_credential(saved_token);
             secure_storage_term(ss_check);
@@ -137,7 +139,7 @@ void test_mfa_totp_authentication(void **unused) {
             snowflake_set_attribute(sf, SF_CON_PASSCODE, NULL);
 
             secure_storage_ptr ss_check2 = secure_storage_init();
-            char* retrieved_token = secure_storage_get_credential(ss_check2, sf->host, mfa_user, MFA_TOKEN);
+            char* retrieved_token = secure_storage_get_credential_v2(ss_check2, sf->host, mfa_user, MFA_TOKEN, NULL, snowflake_url, NULL);
             assert_non_null(retrieved_token);
             secure_storage_free_credential(retrieved_token);
             secure_storage_term(ss_check2);

@@ -76,9 +76,26 @@ index 8b1524b337d..db14a0c1182 100644
  
          AWS_LOGSTREAM_TRACE(AWS_REQUEST_COMPRESSION_LOG_TAG, "Uncompressing request of " << streamSize << " bytes.");
 diff --git a/src/aws-cpp-sdk-core/source/http/curl/CurlHttpClient.cpp b/src/aws-cpp-sdk-core/source/http/curl/CurlHttpClient.cpp
-index 657193f2e11..72fa9359d0b 100644
 --- a/src/aws-cpp-sdk-core/source/http/curl/CurlHttpClient.cpp
 +++ b/src/aws-cpp-sdk-core/source/http/curl/CurlHttpClient.cpp
+@@ -27,6 +27,17 @@
+ using namespace Aws::Utils::Logging;
+ using namespace Aws::Utils::Stream;
+ using namespace Aws::Monitoring;
++
++/*
++ * libsfc registers this so AWS SDK curl handles honor SNOWFLAKE_TLS_CIPHERS
++ * and SNOWFLAKE_MIN_TLS_VERSION. Null until sf_aws_set_tls_policy_fn is called.
++ */
++static int (*g_sfTlsPolicyFn)(CURL *) = nullptr;
++
++extern "C" void sf_aws_set_tls_policy_fn(int (*fn)(CURL *))
++{
++    g_sfTlsPolicyFn = fn;
++}
+ 
+ #ifdef USE_AWS_MEMORY_MANAGEMENT
+ 
 @@ -608,7 +608,7 @@ CurlHttpClient::CurlHttpClient(const ClientConfiguration& clientConfig) :
      m_proxySSLCertPath(clientConfig.proxySSLCertPath), m_proxySSLCertType(clientConfig.proxySSLCertType),
      m_proxySSLKeyPath(clientConfig.proxySSLKeyPath), m_proxySSLKeyType(clientConfig.proxySSLKeyType),
@@ -109,3 +126,21 @@ index 657193f2e11..72fa9359d0b 100644
          }
          else
          {
+@@ -850,7 +861,16 @@
+ 
+         OverrideOptionsOnConnectionHandle(connectionHandle);
+         Aws::Utils::DateTime startTransmissionTime = Aws::Utils::DateTime::Now();
+-        CURLcode curlResponseCode = curl_easy_perform(connectionHandle);
++        CURLcode curlResponseCode = CURLE_OK;
++        if (g_sfTlsPolicyFn && g_sfTlsPolicyFn(connectionHandle) != 0)
++        {
++            curlResponseCode = CURLE_SSL_CONNECT_ERROR;
++            AWS_LOGSTREAM_ERROR(CURL_HTTP_CLIENT_TAG, "TLS policy rejected the AWS SDK curl handle");
++        }
++        else
++        {
++            curlResponseCode = curl_easy_perform(connectionHandle);
++        }
+         curl_easy_setopt(connectionHandle, CURLOPT_ERRORBUFFER, nullptr);
+         bool shouldContinueRequest = ContinueRequest(*request);
+         if (curlResponseCode != CURLE_OK && shouldContinueRequest)

@@ -70,8 +70,9 @@ void test_usr_pwd_mfa_caches_token(void** unused)
 {
     SF_UNUSED(unused);
 
+    const std::string snowflakeUrl = std::string(HOST) + ":" + wiremockPort;
     secure_storage_ptr ss = secure_storage_init();
-    secure_storage_remove_credential(ss, HOST, USER, MFA_TOKEN);
+    secure_storage_remove_credential_v2(ss, HOST, USER, MFA_TOKEN, NULL, snowflakeUrl.c_str(), NULL);
     secure_storage_term(ss);
 
     WiremockRunner* wm = new WiremockRunner("login_response.json", {});
@@ -91,7 +92,7 @@ void test_usr_pwd_mfa_caches_token(void** unused)
     delete wm;
 
     ss = secure_storage_init();
-    char* cached_token = secure_storage_get_credential(ss, HOST, USER, MFA_TOKEN);
+    char* cached_token = secure_storage_get_credential_v2(ss, HOST, USER, MFA_TOKEN, NULL, snowflakeUrl.c_str(), NULL);
     assert_non_null(cached_token);
     assert_string_equal(cached_token, "cached-mfa-token-value");
     secure_storage_free_credential(cached_token);

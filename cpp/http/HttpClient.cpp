@@ -3,6 +3,7 @@
 #include "../logger/SFLogger.hpp"
 #include "constants.h"
 #include "openssl/ssl.h"
+#include <snowflake/tls_policy.h>
 #include <curl/curl.h>
 
 namespace Snowflake {
@@ -43,7 +44,6 @@ namespace Snowflake {
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *) &response);
         curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, SimpleHttpClient::writeheader);
         curl_easy_setopt(curl, CURLOPT_HEADERDATA, (void*) &response);
-        curl_easy_setopt(curl, CURLOPT_SSLVERSION, m_tlsVersion);
         // capture negotiated SSL version for diagnostics
         curl_easy_setopt(m_curl, CURLOPT_PREREQFUNCTION, prereqCallback);
         curl_easy_setopt(m_curl, CURLOPT_PREREQDATA, (void*)this);
@@ -63,6 +63,16 @@ namespace Snowflake {
         }
         if (header_list) {
           curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
+        }
+
+        // Floor m_tlsVersion so a MAX cap from setTlsVersion is kept.
+        if (sf_curl_apply_tls_policy_with_version(curl, m_tlsVersion) != 0) {
+          CXX_LOG_ERROR("Failed to apply TLS policy");
+          if (header_list) {
+            curl_slist_free_all(header_list);
+          }
+          curl_easy_cleanup(curl);
+          return boost::none;
         }
 
         CURLcode res = curl_easy_perform(curl);

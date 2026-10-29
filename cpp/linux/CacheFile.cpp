@@ -2,14 +2,17 @@
 
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <unistd.h>
 
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 
 #include <picojson.h>
 #include <boost/filesystem.hpp>
 
 #include "../logger/SFLogger.hpp"
-#include "../util/Sha256.hpp"
 
 namespace {
   class FileDescriptor {
@@ -19,7 +22,9 @@ namespace {
     explicit FileDescriptor(int fd) : m_fd(fd) {}
 
     ~FileDescriptor() {
-      close(m_fd);
+      if (m_fd != -1) {
+        close(m_fd);
+      }
     }
     operator int() const { return m_fd; }
     int get() const { return m_fd; }
@@ -28,7 +33,9 @@ namespace {
   };
 
   using namespace Snowflake::Client;
-  const char* CREDENTIAL_FILE_NAME = "credential_cache_v1.json";
+  const char* DEFAULT_CREDENTIAL_FILE_NAME = "credential_cache_v2.json";
+  const char* CREDENTIAL_FILE_NAME_ENV = "SF_TEMPORARY_CREDENTIAL_CACHE_FILE_NAME";
+  const char* CREDENTIAL_DIR_ENV = "SF_TEMPORARY_CREDENTIAL_CACHE_DIR";
 
   bool mkdirIfNotExists(const std::string& dir, mode_t mode)
   {
@@ -54,12 +61,29 @@ namespace {
   {
     char *root = getenv(envVar.c_str());
 
-    if (root == nullptr)
+    if (root == nullptr || root[0] == '\0')
     {
       return {};
     }
 
     return std::string(root);
+  }
+
+  boost::optional<std::string> getCredentialFileName()
+  {
+    auto overrideOpt = getEnv(CREDENTIAL_FILE_NAME_ENV);
+    if (!overrideOpt)
+    {
+      return std::string(DEFAULT_CREDENTIAL_FILE_NAME);
+    }
+
+    const std::string& name = overrideOpt.get();
+    if (name.find('/') != std::string::npos || name == "." || name == "..")
+    {
+      CXX_LOG_ERROR("%s=%s is not a plain file name.", CREDENTIAL_FILE_NAME_ENV, name.c_str());
+      return {};
+    }
+    return name;
   }
 
   void ensureObject(picojson::value &val)
@@ -80,29 +104,118 @@ namespace {
     return tokens.get<picojson::object>();
   }
 
-  bool ensurePermissions(const FileDescriptor& fd, mode_t mode)
+  std::string openError(const std::string &path)
+  {
+    if (errno == ELOOP)
+    {
+      return "Irregular file type for cache file(path=" + path + ")";
+    }
+    return "Failed to open cache file(path=" + path + ", errno=" + std::to_string(errno) + ")";
+  }
+
+  std::string ensureSafeFile(const FileDescriptor& fd)
   {
     struct stat s = {};
-    int err = fstat(fd, &s);
-    if (err == -1)
+    if (fstat(fd, &s) == -1)
     {
-      CXX_LOG_ERROR("Cannot ensure permissions. fstat(%d, %o) failed with errno=%d", fd.get(), mode, errno);
-      return false;
+      return "fstat failed with errno=" + std::to_string(errno);
+    }
+
+    if (!S_ISREG(s.st_mode))
+    {
+      return "Cache file is not a regular file";
     }
 
     if (s.st_uid != geteuid())
     {
-      CXX_LOG_ERROR("Cannot ensure permissions. Cache file is not owned by effective user.");
-      return false;
+      return "Cache file is not owned by effective user";
     }
 
-    if ((s.st_mode & 0777) != mode)
+    if ((s.st_mode & 0777) != 0600)
     {
-      CXX_LOG_ERROR("Cannot ensure permissions. Cache file permissions are %o != %o", s.st_mode & 0777, mode);
-      return false;
+      char mode[8];
+      snprintf(mode, sizeof(mode), "%o", static_cast<unsigned>(s.st_mode & 0777));
+      return std::string("Cache file permissions are ") + mode + " instead of 600";
     }
 
-    return true;
+    return {};
+  }
+
+  std::string readAll(const FileDescriptor& fd, std::string &contents)
+  {
+    if (lseek(fd, 0, SEEK_SET) == -1)
+    {
+      return "Failed to seek start of cache file, errno=" + std::to_string(errno);
+    }
+
+    contents.clear();
+    char buf[4096];
+    while (true)
+    {
+      ssize_t bytesRead = read(fd, buf, sizeof(buf));
+      if (bytesRead == -1)
+      {
+        if (errno == EINTR)
+        {
+          continue;
+        }
+        return "Failed to read cache file, errno=" + std::to_string(errno);
+      }
+      if (bytesRead == 0)
+      {
+        return {};
+      }
+      contents.append(buf, static_cast<size_t>(bytesRead));
+    }
+  }
+
+  void parseLenient(const std::string &contents, const std::string &path, picojson::value &result)
+  {
+    if (contents.empty())
+    {
+      result = picojson::value(picojson::object());
+      return;
+    }
+
+    std::string error = picojson::parse(result, contents);
+    if (!error.empty())
+    {
+      CXX_LOG_WARN("Cache file(path=%s) is not valid JSON, treating it as empty. Error: %s", path.c_str(), error.c_str());
+      result = picojson::value(picojson::object());
+    }
+  }
+
+  std::string writeAll(const FileDescriptor& fd, const std::string &buf)
+  {
+    if (lseek(fd, 0, SEEK_SET) == -1)
+    {
+      return "Failed to seek start of cache file, errno=" + std::to_string(errno);
+    }
+    if (ftruncate(fd, 0) == -1)
+    {
+      return "Failed to truncate cache file, errno=" + std::to_string(errno);
+    }
+
+    size_t written = 0;
+    while (written < buf.size())
+    {
+      ssize_t n = write(fd, buf.data() + written, buf.size() - written);
+      if (n == -1)
+      {
+        if (errno == EINTR)
+        {
+          continue;
+        }
+        return "Failed to write cache file, errno=" + std::to_string(errno);
+      }
+      written += static_cast<size_t>(n);
+    }
+
+    if (fsync(fd) == -1)
+    {
+      return "Failed to flush cache file, errno=" + std::to_string(errno);
+    }
+    return {};
   }
 }
 
@@ -124,27 +237,27 @@ namespace Client {
 
     if (err != 0)
     {
-      CXX_LOG_INFO("Failed to stat %s=%s, errno=%d. Skipping it in cache file location lookup.", envVar.c_str(), envVarValue.c_str(), errno);
+      CXX_LOG_INFO("Failed to stat %s=%s, errno=%d.", envVar.c_str(), envVarValue.c_str(), errno);
       return {};
     }
 
     if (!S_ISDIR(s.st_mode))
     {
-      CXX_LOG_INFO("%s=%s is not a directory. Skipping it in cache file location lookup.", envVar.c_str(), envVarValue.c_str());
+      CXX_LOG_INFO("%s=%s is not a directory.", envVar.c_str(), envVarValue.c_str());
       return {};
     }
 
     auto cacheDir = envVarValue;
     for (const auto &segment: subPathSegments) {
-      if (!mkdirIfNotExists(cacheDir, 0755)) {
-        CXX_LOG_INFO("Could not create cache dir=%s. Skipping it in cache file location lookup.", cacheDir.c_str());
+      if (!mkdirIfNotExists(cacheDir, 0700)) {
+        CXX_LOG_INFO("Could not create cache dir=%s.", cacheDir.c_str());
         return {};
       }
       cacheDir.append(PATH_SEP + segment);
     }
 
     if (!mkdirIfNotExists(cacheDir, 0700)) {
-      CXX_LOG_INFO("Could not create cache dir=%s. Skipping it in cache file location lookup.", cacheDir.c_str());
+      CXX_LOG_INFO("Could not create cache dir=%s.", cacheDir.c_str());
       return {};
     }
 
@@ -152,25 +265,25 @@ namespace Client {
 
     if (err != 0)
     {
-      CXX_LOG_INFO("Failed to stat %s, errno=%d. Skipping it in cache file location lookup.", envVar.c_str(), errno);
+      CXX_LOG_INFO("Failed to stat %s, errno=%d.", cacheDir.c_str(), errno);
       return {};
     }
 
     if (!S_ISDIR(s.st_mode))
     {
-      CXX_LOG_INFO("%s is not a directory. Skipping it in cache file location lookup.", cacheDir.c_str());
+      CXX_LOG_INFO("%s is not a directory.", cacheDir.c_str());
       return {};
     }
 
     if (s.st_uid != geteuid())
     {
-      CXX_LOG_INFO("%s is not owned by effective user. Skipping it in cache file location lookup.", cacheDir.c_str());
+      CXX_LOG_INFO("%s is not owned by effective user.", cacheDir.c_str());
       return {};
     }
 
     if ((s.st_mode & 0777) != 0700)
     {
-      CXX_LOG_INFO("%s has incorrect permissions. Skipping it in cache file location lookup.", cacheDir.c_str());
+      CXX_LOG_INFO("%s has incorrect permissions.", cacheDir.c_str());
       return {};
     }
 
@@ -179,83 +292,116 @@ namespace Client {
 
   boost::optional<std::string> getCredentialFilePath()
   {
-    std::vector<std::function<boost::optional<std::string>()>> lookupFunctions =
+    auto fileNameOpt = getCredentialFileName();
+    if (!fileNameOpt)
     {
-        []() { return getCacheDir("SF_TEMPORARY_CREDENTIAL_CACHE_DIR", {}); },
-        [](){ return getCacheDir("XDG_CACHE_HOME", {"snowflake"}); },
-        [](){ return getCacheDir("HOME", {".cache", "snowflake"}); },
-    };
+      return {};
+    }
 
-    for (const auto& lf: lookupFunctions) {
-      boost::optional<std::string> directory = lf();
-      if (directory)
+    boost::optional<std::string> directory;
+    if (getEnv(CREDENTIAL_DIR_ENV))
+    {
+      directory = getCacheDir(CREDENTIAL_DIR_ENV, {});
+      if (!directory)
       {
-        auto path = directory.get() + PATH_SEP + CREDENTIAL_FILE_NAME;
-        CXX_LOG_TRACE("Successfully found credential file path=%s", path.c_str());
-        return path;
+        CXX_LOG_ERROR("%s is set but is not a usable cache directory.", CREDENTIAL_DIR_ENV);
+        return {};
+      }
+    }
+    else
+    {
+      directory = getCacheDir("XDG_CACHE_HOME", {"snowflake"});
+      if (!directory)
+      {
+        directory = getCacheDir("HOME", {".cache", "snowflake"});
       }
     }
 
-    return {};
-  };
+    if (!directory)
+    {
+      return {};
+    }
 
-  std::string readFile(const std::string &path, picojson::value &result) {
-    FileDescriptor fd{open(path.c_str(), O_RDONLY)};
+    auto path = directory.get() + PATH_SEP + fileNameOpt.get();
+    CXX_LOG_TRACE("Successfully found credential file path=%s", path.c_str());
+    return path;
+  }
+
+  std::string readCacheFile(const std::string &path, picojson::value &result) {
+    FileDescriptor fd{open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC)};
     if (fd == -1) {
       if (errno == ENOENT) {
         result = picojson::value(picojson::object());
         return {};
       }
-      else {
-        return "Failed to open " + path + " errno=" + std::to_string(errno);
-      }
+      return openError(path);
     }
 
-    if (!ensurePermissions(fd, 0600))
-    {
-      return "Failed to ensure permissions for file(path=" + path + ")";
-    }
-
-    off_t fileSize = lseek(fd, 0, SEEK_END);
-    if (fileSize == -1) {
-      return "Failed to seek end of file(path=" + path + ")";
-    }
-    if (lseek(fd, 0, SEEK_SET) == -1) {
-      return "Failed to seek start of file(path=" + path + ")";
-    }
-
-    std::string fileContents;
-    fileContents.resize(fileSize);
-    ssize_t bytesRead = read(fd, fileContents.data(), fileSize);
-    if (bytesRead == -1) {
-      return "Failed to read file(path=" + path + ", errno=" + std::to_string(errno) + ")";
-    }
-    fileContents.resize(bytesRead);
-
-    std::string error = picojson::parse(result, fileContents);
+    std::string error = ensureSafeFile(fd);
     if (!error.empty())
     {
-      return "Failed to parse the file: " + error;
+      return error + " (path=" + path + ")";
     }
+
+    std::string contents;
+    error = readAll(fd, contents);
+    if (!error.empty())
+    {
+      return error + " (path=" + path + ")";
+    }
+
+    parseLenient(contents, path, result);
     return {};
   }
 
-  std::string writeFile(const std::string &path, const picojson::value &result) {
-    FileDescriptor fd{open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600)};
-    if (fd == -1)
+  std::string updateCacheFile(const std::string &path, bool createIfMissing,
+                              const std::function<bool(picojson::value&)> &modify) {
+    bool created = false;
+    int rawFd = open(path.c_str(), O_RDWR | O_NOFOLLOW | O_CLOEXEC);
+    if (rawFd == -1 && errno == ENOENT)
     {
-      return "Failed to open the file(path=" + path + ")";
+      if (!createIfMissing)
+      {
+        return {};
+      }
+      rawFd = open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+      created = true;
+    }
+    if (rawFd == -1)
+    {
+      return openError(path);
+    }
+    FileDescriptor fd{rawFd};
+
+    if (created && fchmod(fd, 0600) == -1)
+    {
+      return "Failed to set permissions on new cache file(path=" + path + ", errno=" + std::to_string(errno) + ")";
     }
 
-    if (!ensurePermissions(fd, 0600))
+    std::string error = ensureSafeFile(fd);
+    if (!error.empty())
     {
-      return "Cannot ensure correct permissions on a file";
+      return error + " (path=" + path + ")";
     }
 
-    std::string buf = result.serialize();
-    int bytesWritten = write(fd, buf.data(), buf.size());
-    if (bytesWritten == -1) {
-      return "Failed to write to a file(path=" + path + ", errno=" + std::to_string(errno) + ")";
+    std::string contents;
+    error = readAll(fd, contents);
+    if (!error.empty())
+    {
+      return error + " (path=" + path + ")";
+    }
+
+    picojson::value cache;
+    parseLenient(contents, path, cache);
+    if (!modify(cache))
+    {
+      return {};
+    }
+
+    error = writeAll(fd, cache.serialize());
+    if (!error.empty())
+    {
+      return error + " (path=" + path + ")";
     }
     return {};
   }
@@ -266,10 +412,10 @@ namespace Client {
     tokens[key] = picojson::value(credential);
   }
 
-  void cacheFileRemove(picojson::value &cache, const std::string &key)
+  bool cacheFileRemove(picojson::value &cache, const std::string &key)
   {
     picojson::object& tokens = getTokens(cache);
-    tokens.erase(key);
+    return tokens.erase(key) > 0;
   }
 
   boost::optional<std::string> cacheFileGet(picojson::value &cache, const std::string &key) {

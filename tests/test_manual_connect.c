@@ -317,6 +317,18 @@ void test_external_browser(void** unused)
     snowflake_term(sf);
 }
 
+// The `snowflake` token cache key component the driver uses for `sf`: the
+// host, plus ":<port>" when the port was set explicitly.
+static void token_cache_snowflake_url(SF_CONNECT *sf, char *buf, size_t bufsize)
+{
+    const char *host = sf->host ? sf->host : "";
+    if (sf->port_explicit && sf->port && sf->port[0] != '\0') {
+        snprintf(buf, bufsize, "%s:%s", host, sf->port);
+    } else {
+        snprintf(buf, bufsize, "%s", host);
+    }
+}
+
 void test_sso_token_auth(void** unused)
 {
     SF_UNUSED(unused);
@@ -355,8 +367,10 @@ void test_sso_token_auth(void** unused)
         }
 
         if (i != 1) {
+            char snowflake_url[1024];
+            token_cache_snowflake_url(sf, snowflake_url, sizeof(snowflake_url));
             sf->token_cache = secure_storage_init();
-            secure_storage_remove_credential(sf->token_cache, sf->host, sf->user, ID_TOKEN);
+            secure_storage_remove_credential_v2(sf->token_cache, sf->host, sf->user, ID_TOKEN, NULL, snowflake_url, NULL);
         }
        
         SF_STATUS status = snowflake_connect(sf);
@@ -402,9 +416,11 @@ void test_sso_token_auth_renew(void** unused)
     if (protocol) {
         snowflake_set_attribute(sf, SF_CON_PROTOCOL, protocol);
     }
+    char snowflake_url[1024];
+    token_cache_snowflake_url(sf, snowflake_url, sizeof(snowflake_url));
     sf->token_cache = secure_storage_init();
-    secure_storage_remove_credential(sf->token_cache, sf->host, sf->user, ID_TOKEN);
-    secure_storage_save_credential(sf->token_cache, sf->host, sf->user, ID_TOKEN, "wrong token");
+    secure_storage_remove_credential_v2(sf->token_cache, sf->host, sf->user, ID_TOKEN, NULL, snowflake_url, NULL);
+    secure_storage_save_credential_v2(sf->token_cache, sf->host, sf->user, ID_TOKEN, NULL, snowflake_url, NULL, "wrong token");
 
     SF_STATUS status = snowflake_connect(sf);
     if (status != SF_STATUS_SUCCESS) {

@@ -46,6 +46,7 @@ SET(TESTS_C
         test_unit_mfa_auth
         test_ocsp_fail_open
         test_unit_ocsp_defaults
+        test_tls_policy
         test_unit_privatelink
         test_multiple_statements
         test_async
@@ -94,6 +95,7 @@ SET(TESTS_CXX
         test_unit_ocsp_cache
         test_unit_stopwatch
         test_tls_version
+        test_unit_token_cache_key
 )
 
 if (LINUX)

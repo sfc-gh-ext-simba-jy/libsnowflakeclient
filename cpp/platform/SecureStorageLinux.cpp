@@ -23,6 +23,14 @@ namespace Client {
 
   SecureStorageStatus SecureStorage::storeToken(const SecureStorageKey& key, const std::string& token)
   {
+    auto targetOpt = convertTarget(key);
+    if (!targetOpt)
+    {
+      CXX_LOG_ERROR("Cannot store token. Failed to convert key to string.");
+      return SecureStorageStatus::Error;
+    }
+    const std::string& target = targetOpt.get();
+
     auto pathOpt = getCredentialFilePath();
     if (!pathOpt)
     {
@@ -39,25 +47,12 @@ namespace Client {
       return SecureStorageStatus::Error;
     }
 
-    picojson::value contents;
-    std::string error = readFile(path, contents);
+    std::string error = updateCacheFile(path, true, [&](picojson::value& contents) {
+      cacheFileUpdate(contents, target, token);
+      return true;
+    });
     if (!error.empty()) {
-      CXX_LOG_WARN("Failed to read file(path=%s). Error: %s", path.c_str(), error.c_str())
-      contents = picojson::value(picojson::object());
-    }
-
-    auto targetOpt = convertTarget(key);
-    if (!targetOpt)
-    {
-      CXX_LOG_ERROR("Cannot store token. Failed to convert key to string.");
-      return SecureStorageStatus::Error;
-    }
-    std::string& target = targetOpt.get();
-    cacheFileUpdate(contents, target, token);
-
-    error = writeFile(path, contents);
-    if (!error.empty()) {
-      CXX_LOG_ERROR("Failed to write file(path=%s). Error: %s", path.c_str(), error.c_str());
+      CXX_LOG_ERROR("Failed to store token. Error: %s", error.c_str());
       return SecureStorageStatus::Error;
     }
 
@@ -67,6 +62,14 @@ namespace Client {
 
   SecureStorageStatus SecureStorage::retrieveToken(const SecureStorageKey& key, std::string& token)
   {
+    auto targetOpt = convertTarget(key);
+    if (!targetOpt)
+    {
+      CXX_LOG_ERROR("Cannot retrieve token. Failed to convert key to string.");
+      return SecureStorageStatus::Error;
+    }
+    const std::string& target = targetOpt.get();
+
     auto pathOpt = getCredentialFilePath();
     if (!pathOpt)
     {
@@ -83,20 +86,12 @@ namespace Client {
     }
 
     picojson::value contents;
-
-    std::string error = readFile(path, contents);
+    std::string error = readCacheFile(path, contents);
     if (!error.empty()) {
-      CXX_LOG_WARN("Failed to read file(path=%s). Error: %s", path.c_str(), error.c_str());
-      contents = picojson::value(picojson::object());
-    }
-
-    auto targetOpt = convertTarget(key);
-    if (!targetOpt)
-    {
-      CXX_LOG_ERROR("Cannot retrieve token. Failed to convert key to string.");
+      CXX_LOG_ERROR("Failed to retrieve token. Error: %s", error.c_str());
       return SecureStorageStatus::Error;
     }
-    std::string& target = targetOpt.get();
+
     auto tokenOpt = cacheFileGet(contents, target);
     if (!tokenOpt)
     {
@@ -110,6 +105,14 @@ namespace Client {
 
   SecureStorageStatus SecureStorage::removeToken(const SecureStorageKey& key)
   {
+    auto targetOpt = convertTarget(key);
+    if (!targetOpt)
+    {
+      CXX_LOG_ERROR("Cannot remove token. Failed to convert key to string.");
+      return SecureStorageStatus::Error;
+    }
+    const std::string& target = targetOpt.get();
+
     auto pathOpt = getCredentialFilePath();
     if (!pathOpt)
     {
@@ -125,26 +128,11 @@ namespace Client {
       return SecureStorageStatus::Error;
     }
 
-    picojson::value contents;
-    std::string error = readFile(path, contents);
-    if (!error.empty())
-    {
-      CXX_LOG_WARN("Failed to read file(path=%s). Error: %s", path.c_str(), error.c_str())
-      contents = picojson::value(picojson::object());
-    }
-
-    auto targetOpt = convertTarget(key);
-    if (!targetOpt)
-    {
-      CXX_LOG_ERROR("Cannot remove token. Failed to convert key to string.");
-      return SecureStorageStatus::Error;
-    }
-    std::string& target = targetOpt.get();
-    cacheFileRemove(contents, target);
-
-    error = writeFile(path, contents);
+    std::string error = updateCacheFile(path, false, [&](picojson::value& contents) {
+      return cacheFileRemove(contents, target);
+    });
     if (!error.empty()) {
-      CXX_LOG_ERROR("Failed to write file(path=%s). Error: %s", path.c_str(), error.c_str());
+      CXX_LOG_ERROR("Failed to remove token. Error: %s", error.c_str());
       return SecureStorageStatus::Error;
     }
 

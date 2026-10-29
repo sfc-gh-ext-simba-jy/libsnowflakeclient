@@ -1,5 +1,15 @@
+#include <stdio.h>
 #include <stdlib.h>
 #include "auth_utils.h"
+
+void token_cache_snowflake_url(SF_CONNECT *sf, char *buf, size_t bufsize) {
+    const char *host = sf->host ? sf->host : "";
+    if (sf->port_explicit && sf->port && sf->port[0] != '\0') {
+        snprintf(buf, bufsize, "%s:%s", host, sf->port);
+    } else {
+        snprintf(buf, bufsize, "%s", host);
+    }
+}
 
 void set_all_snowflake_attributes(SF_CONNECT *sf) {
     snowflake_set_attribute(sf, SF_CON_ACCOUNT,

@@ -143,7 +143,9 @@ jobs:
               if: github.ref_name == github.event.repository.default_branch && matrix.cloud_provider == 'AWS'
             - uses: actions/setup-python@v6
               with:
-                python-version: '>=3.13.5' # temporary bound until it becomes the default, https://github.com/python/cpython/issues/135151
+                # 3.14 stays above the 3.13.4 Windows installer bug (python/cpython#135151)
+                # and is the newest CPython with a snowflake-connector-python wheel.
+                python-version: '3.14'
                 architecture: 'x64'
             - name: Test
               shell: cmd
